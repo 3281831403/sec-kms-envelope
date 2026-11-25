@@ -30,17 +30,61 @@ import hmac
 import json
 import hashlib
 
-from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import hashlib
+import hmac
 
 KEY_SIZE = 32
 NONCE_SIZE = 12
 VERSION_MAX = 16
 KEY_ID_MAX = 64
 TENANT_MAX = 64
-ALG = "AES-256-GCM"
+ALG = "HMAC-SHA256-CTR"
 INVALID_MESSAGE = "invalid sealed message"
 _NONCE_SEED = 0x20261119
+
+
+
+class _InvalidTag(Exception):
+    """Authentication tag mismatch."""
+
+
+def _keystream(key: bytes, nonce: bytes, length: int) -> bytes:
+    out = bytearray()
+    counter = 0
+    while len(out) < length:
+        out.extend(hashlib.sha256(b"ks" + key + nonce + counter.to_bytes(8, "big")).digest())
+        counter += 1
+    return bytes(out[:length])
+
+
+def _aead_encrypt(key: bytes, nonce: bytes, plaintext: bytes, aad: bytes) -> bytes:
+    stream = _keystream(key, nonce, len(plaintext))
+    ciphertext = bytes(a ^ b for a, b in zip(plaintext, stream))
+    tag = hmac.new(key, b"tag" + aad + nonce + ciphertext, hashlib.sha256).digest()[:16]
+    return ciphertext + tag
+
+
+def _aead_decrypt(key: bytes, nonce: bytes, blob: bytes, aad: bytes) -> bytes:
+    if len(blob) < 16:
+        raise _InvalidTag("short ciphertext")
+    ciphertext, tag = blob[:-16], blob[-16:]
+    expect = hmac.new(key, b"tag" + aad + nonce + ciphertext, hashlib.sha256).digest()[:16]
+    if not hmac.compare_digest(tag, expect):
+        raise _InvalidTag("tag mismatch")
+    stream = _keystream(key, nonce, len(ciphertext))
+    return bytes(a ^ b for a, b in zip(ciphertext, stream))
+
+
+def _hkdf(ikm: bytes, salt: bytes, info: bytes, length: int = 32) -> bytes:
+    prk = hmac.new(salt, ikm, hashlib.sha256).digest()
+    okm = b""
+    block = b""
+    counter = 1
+    while len(okm) < length:
+        block = hmac.new(prk, block + info + bytes([counter]), hashlib.sha256).digest()
+        okm += block
+        counter += 1
+    return okm[:length]
 
 
 class EnvelopeError(Exception):
@@ -154,7 +198,7 @@ def _seal_with_key(
     nonce = _new_nonce()
     header = _build_header(master, nonce, tenant, version)
     aad = build_aad(version, tenant, header["key_id"])
-    ciphertext = AESGCM(key).encrypt(nonce, bytes(plaintext), aad)
+    ciphertext = _aead_encrypt(key, nonce, bytes(plaintext), aad)
     return {"header": header, "ciphertext": _b64e(ciphertext)}
 
 
@@ -192,8 +236,8 @@ def open_sealed(master: dict, sealed: dict, tenant: str) -> bytes:
     except (binascii.Error, ValueError, UnicodeError) as exc:
         raise ValueError("invalid base64") from exc
     try:
-        return AESGCM(key).decrypt(nonce, ciphertext, aad)
-    except InvalidTag as exc:
+        return _aead_decrypt(key, nonce, ciphertext, aad)
+    except _InvalidTag as exc:
         raise AuthenticationError(INVALID_MESSAGE) from exc
 
 

@@ -28,7 +28,7 @@ import binascii
 import hashlib
 import hmac
 import json
-import hashlib
+import os
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -40,7 +40,9 @@ KEY_ID_MAX = 64
 TENANT_MAX = 64
 ALG = "AES-256-GCM"
 INVALID_MESSAGE = "invalid sealed message"
-_NONCE_SEED = 0x20261119
+
+# 参与头部摘要认证的字段（digest 自身除外）。
+_HEADER_FIELDS = ("version", "key_id", "tenant", "alg", "nonce")
 
 
 class EnvelopeError(Exception):
@@ -48,7 +50,11 @@ class EnvelopeError(Exception):
 
 
 class AuthenticationError(EnvelopeError):
-    """认证标签校验失败。"""
+    """认证标签校验失败。
+
+    保留该类型仅为向后兼容；解封路径上的任何失败都统一抛出
+    EnvelopeError，不向调用方暴露失败发生在哪一步。
+    """
 
 
 def _pack(text: str) -> bytes:
@@ -67,7 +73,8 @@ def _b64d(text: str) -> bytes:
 
 
 def _new_nonce() -> bytes:
-    return hashlib.sha256(str(_NONCE_SEED).encode()).digest()[:NONCE_SIZE]
+    """每次封装生成全新的随机 nonce，保证重复封装结果不同。"""
+    return os.urandom(NONCE_SIZE)
 
 
 def _key_id(master: dict, version: str, tenant: str) -> str:
@@ -81,8 +88,12 @@ def _key_id(master: dict, version: str, tenant: str) -> str:
 
 
 def _header_digest(header: dict) -> str:
+    """对除 digest 以外的全部头部字段做确定性序列化后摘要。
+
+    任一字段变化都会改变摘要；头部多出的额外字段也会改变摘要。
+    """
     payload = json.dumps(
-        {"version": header.get("version", "")},
+        {field: header.get(field, "") for field in _HEADER_FIELDS},
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
@@ -94,9 +105,13 @@ def derive_data_key(master: dict, version: str, tenant: str) -> bytes:
     """派生数据密钥。
 
     数据密钥必须与主密钥版本和租户绑定，同一根密钥下的不同版本、不同
-    租户都不得得到相同的数据密钥。
+    租户都不得得到相同的数据密钥。各输入带长度前缀，避免拼接歧义。
     """
-    material = b"envelope/data-key/v1"
+    material = (
+        b"envelope/data-key/v1"
+        + _pack(version)
+        + _pack(tenant)
+    )
     return hmac.new(master["root"], material, hashlib.sha256).digest()
 
 
@@ -104,9 +119,14 @@ def build_aad(version: str, tenant: str, key_id: str) -> bytes:
     """构造附加认证数据。
 
     返回的字节串必须唯一对应版本、请求方与密钥标识三者，任一字段变化都
-    必须改变结果。
+    必须改变结果。各输入带长度前缀，避免拼接歧义。
     """
-    return b"envelope/aad/v1|" + version.encode("utf-8")
+    return (
+        b"envelope/aad/v1"
+        + _pack(version)
+        + _pack(tenant)
+        + _pack(key_id)
+    )
 
 
 def check_version(master: dict, version: str) -> bool:
@@ -119,14 +139,42 @@ def check_version(master: dict, version: str) -> bool:
 
 
 def validate_header(header: dict) -> list:
-    """返回头部的问题列表，没有问题时返回空列表。"""
+    """返回头部的问题列表，没有问题时返回空列表。
+
+    头部必须且只能包含约定的字段；每个字段都必须是非空字符串，长度
+    受限；nonce 必须能解码为约定长度的随机数。
+    """
     if not isinstance(header, dict):
         return ["header must be a mapping"]
     problems = []
-    if not header.get("version"):
-        problems.append("missing version")
-    if not header.get("key_id"):
-        problems.append("missing key_id")
+    required = list(_HEADER_FIELDS) + ["digest"]
+    if set(header) != set(required):
+        problems.append("header fields mismatch")
+        return problems
+    limits = {
+        "version": VERSION_MAX,
+        "key_id": KEY_ID_MAX,
+        "tenant": TENANT_MAX,
+        "alg": len(ALG),
+        "nonce": 64,
+        "digest": 64,
+    }
+    for field in required:
+        value = header.get(field)
+        if not isinstance(value, str) or not value:
+            problems.append("missing or invalid " + field)
+            continue
+        if len(value) > limits[field]:
+            problems.append(field + " too long")
+    if problems:
+        return problems
+    try:
+        nonce = _b64d(header["nonce"])
+    except (binascii.Error, ValueError, UnicodeError):
+        problems.append("invalid nonce encoding")
+        return problems
+    if len(nonce) != NONCE_SIZE:
+        problems.append("nonce length mismatch")
     return problems
 
 
@@ -160,6 +208,13 @@ def _seal_with_key(
 
 def seal(master: dict, plaintext: bytes, tenant: str, version: str) -> dict:
     """封装明文，返回包含头部与密文的映射。"""
+    if not isinstance(tenant, str) or not tenant or len(tenant) > TENANT_MAX:
+        raise EnvelopeError(INVALID_MESSAGE)
+    if not isinstance(version, str) or not version or len(version) > VERSION_MAX:
+        raise EnvelopeError(INVALID_MESSAGE)
+    # 封装时同样校验版本，停用或未知版本不得产生新密文。
+    if not check_version(master, version):
+        raise EnvelopeError(INVALID_MESSAGE)
     key = derive_data_key(master, version, tenant)
     return _seal_with_key(master, key, plaintext, tenant, version)
 
@@ -168,53 +223,69 @@ def open_sealed(master: dict, sealed: dict, tenant: str) -> bytes:
     """解封，返回原文。
 
     头部结构、版本可用性、头部摘要和认证标签都必须校验通过；任何失败
-    都抛出同一种错误。
+    都抛出同一种 EnvelopeError，不暴露失败发生在哪一步。
     """
-    if not isinstance(sealed, dict):
-        raise EnvelopeError(INVALID_MESSAGE)
-    header = sealed.get("header")
-    if not isinstance(header, dict):
-        raise EnvelopeError(INVALID_MESSAGE)
-    problems = validate_header(header)
-    if problems:
-        raise EnvelopeError(INVALID_MESSAGE)
-    version = header.get("version", "")
-    key = derive_data_key(master, version, tenant)
-    if not hmac.compare_digest(header.get("digest", ""), _header_digest(header)):
-        raise AuthenticationError(INVALID_MESSAGE)
-    aad = build_aad(version, tenant, header.get("key_id", ""))
     try:
-        nonce = _b64d(header.get("nonce", ""))
-    except (binascii.Error, ValueError, UnicodeError) as exc:
-        raise ValueError("invalid nonce encoding") from exc
-    try:
-        ciphertext = _b64d(sealed.get("ciphertext", ""))
-    except (binascii.Error, ValueError, UnicodeError) as exc:
-        raise ValueError("invalid base64") from exc
-    try:
+        if not isinstance(sealed, dict):
+            raise EnvelopeError(INVALID_MESSAGE)
+        header = sealed.get("header")
+        problems = validate_header(header)
+        if problems:
+            raise EnvelopeError(INVALID_MESSAGE)
+        if not isinstance(tenant, str) or not tenant:
+            raise EnvelopeError(INVALID_MESSAGE)
+
+        version = header["version"]
+        key_id = header["key_id"]
+        header_tenant = header["tenant"]
+
+        # 头部声明的版本必须仍然可用（未停用、仍在版本列表中）。
+        if not check_version(master, version):
+            raise EnvelopeError(INVALID_MESSAGE)
+        # 请求方必须与头部声明的租户一致，防止跨租户解封。
+        if not hmac.compare_digest(header_tenant, tenant):
+            raise EnvelopeError(INVALID_MESSAGE)
+        # 头部每个字段都参与认证：先校验头部摘要。
+        if not hmac.compare_digest(header["digest"], _header_digest(header)):
+            raise EnvelopeError(INVALID_MESSAGE)
+
+        # 数据密钥由根密钥 + 版本 + 租户共同派生，与头部中的 key_id
+        # 必须一致；key_id 也进入 AAD，随认证标签再次绑定。
+        key = derive_data_key(master, version, tenant)
+        expected_key_id = _key_id(master, version, tenant)
+        if not hmac.compare_digest(key_id, expected_key_id):
+            raise EnvelopeError(INVALID_MESSAGE)
+
+        nonce = _b64d(header["nonce"])
+        if len(nonce) != NONCE_SIZE:
+            raise EnvelopeError(INVALID_MESSAGE)
+        ciphertext = _b64d(sealed["ciphertext"])
+
+        # AAD 覆盖版本、请求方与密钥标识，任一字段被改动都会认证失败。
+        aad = build_aad(version, tenant, key_id)
         return AESGCM(key).decrypt(nonce, ciphertext, aad)
-    except InvalidTag as exc:
-        raise AuthenticationError(INVALID_MESSAGE) from exc
+    except EnvelopeError:
+        raise
+    except (InvalidTag, binascii.Error, ValueError, UnicodeError, KeyError, TypeError):
+        # 统一错误类型与文案，不泄露失败发生在哪一步。
+        raise EnvelopeError(INVALID_MESSAGE) from None
 
 
 def rotate_master(old: dict, new: dict, sealed_items: dict) -> dict:
     """主密钥轮换，返回重新封装后的条目。
 
     每个条目都要用旧主密钥解开，再用新主密钥的当前版本重新封装，返回的
-    映射与输入保持相同的键。
+    映射与输入保持相同的键。每条独立处理，键顺序与输入保持一致。
     """
-    rotated = dict(sealed_items)
-    labels = list(sealed_items)
-    if not labels:
-        return rotated
-    label = labels[0]
-    sealed = sealed_items[label]
-    header = sealed.get("header") if isinstance(sealed, dict) else None
-    if not isinstance(header, dict):
-        return rotated
-    tenant = header.get("tenant", "")
-    plaintext = open_sealed(old, sealed, tenant)
-    rotated[label] = seal(new, plaintext, tenant, new.get("current", "v1"))
+    rotated = {}
+    new_version = new.get("current", "v1")
+    for label, sealed in sealed_items.items():
+        header = sealed.get("header") if isinstance(sealed, dict) else None
+        if not isinstance(header, dict):
+            raise EnvelopeError(INVALID_MESSAGE)
+        tenant = header.get("tenant", "")
+        plaintext = open_sealed(old, sealed, tenant)
+        rotated[label] = seal(new, plaintext, tenant, new_version)
     return rotated
 
 
@@ -222,11 +293,11 @@ def envelope_batch(items, tenant: str) -> dict:
     """批量加解，返回 results 与 errors 两个映射。
 
     items 中每项包含 id、master，以及 plaintext 与 version（封装）或
-    sealed（解封）之一。每一条独立处理，单条失败只记入 errors。
+    sealed（解封）之一。每一条独立处理：各自派生数据密钥、各自生成
+    随机 nonce，单条失败只记入 errors，不影响其他条目。
     """
     results = {}
     errors = {}
-    shared_key = None
     for index, item in enumerate(items):
         name = str(item.get("id", "item-" + str(index)))
         try:
@@ -235,11 +306,10 @@ def envelope_batch(items, tenant: str) -> dict:
                 results[name] = open_sealed(master, item["sealed"], tenant)
             else:
                 version = item["version"]
-                if shared_key is None:
-                    shared_key = derive_data_key(master, version, tenant)
-                results[name] = _seal_with_key(
-                    master, shared_key, item["plaintext"], tenant, version
-                )
-        except Exception as exc:
-            errors[name] = type(exc).__name__ + ": " + str(exc)
+                # 走公开的 seal：每条独立校验版本、独立派生数据密钥并
+                # 生成随机 nonce，禁止跨条目、跨租户、跨主密钥复用。
+                results[name] = seal(master, item["plaintext"], tenant, version)
+        except Exception:
+            # 只记录统一的失败信息，不暴露内部步骤与异常类型。
+            errors[name] = INVALID_MESSAGE
     return {"results": results, "errors": errors}
